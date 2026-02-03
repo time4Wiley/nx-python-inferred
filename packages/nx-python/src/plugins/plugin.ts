@@ -162,7 +162,7 @@ async function createNodesInternal(
         `{workspaceRoot}/coverage/${projectRoot}`,
       ],
       options: {
-        command: `${runCmd} pytest ${testsDir}`,
+        command: `${runCmd} python -m pytest ${testsDir}`,
         cwd: projectRoot,
       },
       cache: true,
