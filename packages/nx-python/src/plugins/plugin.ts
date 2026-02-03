@@ -2,6 +2,10 @@ import {
   ImplicitDependency,
   DependencyType,
   CreateDependencies,
+  CreateNodesV2,
+  CreateNodesContextV2,
+  TargetConfiguration,
+  createNodesFromFiles,
   logger,
   StaticDependency,
   DynamicDependency,
@@ -9,14 +13,170 @@ import {
 import { getProvider } from '../provider';
 import { PluginOptions } from '../types';
 import { glob } from 'glob';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { hashFile } from 'nx/src/hasher/file-hasher';
 import { readFile } from 'node:fs/promises';
-import fs from 'node:fs';
+import fs, { readdirSync } from 'node:fs';
 
 const cachedScannedFiles: Record<string, [string, string][]> = {};
 
 const IMPORT_REGEX = /(?:import|from)\s+([a-zA-Z_][\w]*)/g;
+
+// File glob to find all pyproject.toml configuration files
+const pyprojectGlob = '**/pyproject.toml';
+
+/**
+ * CreateNodesV2 function to infer Python project targets from pyproject.toml files
+ */
+export const createNodesV2: CreateNodesV2<PluginOptions> = [
+  pyprojectGlob,
+  async (configFiles, options, context) => {
+    return await createNodesFromFiles(
+      (configFile, options, context) =>
+        createNodesInternal(configFile, options, context),
+      configFiles,
+      options,
+      context,
+    );
+  },
+];
+
+// Re-export as createNodes for Nx 21+ compatibility
+export const createNodes = createNodesV2;
+
+async function createNodesInternal(
+  configFilePath: string,
+  options: PluginOptions,
+  context: CreateNodesContextV2,
+) {
+  // Skip if inferTargets is explicitly disabled
+  if (options?.inferTargets === false) {
+    return {};
+  }
+
+  const projectRoot = dirname(configFilePath);
+
+  // Skip node_modules and other non-project directories
+  if (projectRoot.includes('node_modules') || projectRoot.includes('.venv')) {
+    return {};
+  }
+
+  // Do not create targets if package.json or project.json isn't there
+  const siblingFiles = readdirSync(join(context.workspaceRoot, projectRoot));
+  if (
+    !siblingFiles.includes('package.json') &&
+    !siblingFiles.includes('project.json')
+  ) {
+    return {};
+  }
+
+  const packageManager = options?.packageManager ?? 'uv';
+  const runCmd = packageManager === 'uv' ? 'uv run' : 'poetry run';
+  const lockCmd =
+    packageManager === 'uv' ? 'uv lock' : 'poetry lock --no-update';
+  const syncCmd = packageManager === 'uv' ? 'uv sync' : 'poetry install';
+
+  // Target names with defaults
+  const lockTargetName = options?.lockTargetName ?? 'lock';
+  const addTargetName = options?.addTargetName ?? 'add';
+  const updateTargetName = options?.updateTargetName ?? 'update';
+  const removeTargetName = options?.removeTargetName ?? 'remove';
+  const buildTargetName = options?.buildTargetName ?? 'build';
+  const installTargetName = options?.installTargetName ?? 'install';
+  const lintTargetName = options?.lintTargetName ?? 'lint';
+  const testTargetName = options?.testTargetName ?? 'test';
+
+  // Check for tests directory
+  const hasTests =
+    siblingFiles.includes('tests') || siblingFiles.includes('test');
+
+  // Build targets
+  const targets: Record<string, TargetConfiguration> = {};
+
+  // Lock target
+  targets[lockTargetName] = {
+    executor: '@nxlv/python:run-commands',
+    options: {
+      command: lockCmd,
+      cwd: projectRoot,
+    },
+  };
+
+  // Add target
+  targets[addTargetName] = {
+    executor: '@nxlv/python:add',
+    options: {},
+  };
+
+  // Update target
+  targets[updateTargetName] = {
+    executor: '@nxlv/python:update',
+    options: {},
+  };
+
+  // Remove target
+  targets[removeTargetName] = {
+    executor: '@nxlv/python:remove',
+    options: {},
+  };
+
+  // Build target
+  targets[buildTargetName] = {
+    executor: '@nxlv/python:build',
+    outputs: ['{projectRoot}/dist'],
+    options: {
+      outputPath: `${projectRoot}/dist`,
+      publish: false,
+      lockedVersions: true,
+      bundleLocalDependencies: true,
+    },
+    cache: true,
+  };
+
+  // Install target
+  targets[installTargetName] = {
+    executor: '@nxlv/python:run-commands',
+    options: {
+      command: syncCmd,
+      cwd: projectRoot,
+    },
+  };
+
+  // Lint target
+  targets[lintTargetName] = {
+    executor: '@nxlv/python:flake8',
+    outputs: [`{workspaceRoot}/reports/${projectRoot}/pylint.txt`],
+    options: {
+      outputFile: `reports/${projectRoot}/pylint.txt`,
+    },
+    cache: true,
+  };
+
+  // Test target (only if tests directory exists)
+  if (hasTests) {
+    const testsDir = siblingFiles.includes('tests') ? 'tests/' : 'test/';
+    targets[testTargetName] = {
+      executor: '@nxlv/python:run-commands',
+      outputs: [
+        `{workspaceRoot}/reports/${projectRoot}/unittests`,
+        `{workspaceRoot}/coverage/${projectRoot}`,
+      ],
+      options: {
+        command: `${runCmd} pytest ${testsDir}`,
+        cwd: projectRoot,
+      },
+      cache: true,
+    };
+  }
+
+  return {
+    projects: {
+      [projectRoot]: {
+        targets,
+      },
+    },
+  };
+}
 
 export const createDependencies: CreateDependencies<PluginOptions> = async (
   options,
